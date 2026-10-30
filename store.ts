@@ -1,0 +1,153 @@
+import fs from "node:fs"
+import path from "node:path"
+import { getStore } from "@netlify/blobs"
+import { SAMPLE_RUN_ID } from "./ids"
+import { sampleRun } from "./sample"
+import type { Run } from "./types"
+
+function durable(): boolean {
+  return process.env.NETLIFY === "true" && process.env.NEXT_PHASE !== "phase-production-build"
+}
+
+function blobs() {
+  return getStore({ name: "export-desk", consistency: "strong" })
+}
+
+async function blobGet(id: string): Promise<Run | null> {
+  try {
+    const value = await blobs().get(`run:${id}`, { type: "json", consistency: "strong" })
+    if (!value || typeof value !== "object") return null
+    return value as Run
+  } catch {
+    return null
+  }
+}
+
+async function blobList(): Promise<Run[]> {
+  try {
+    const store = blobs()
+    const listed = await store.list({ prefix: "run:" })
+    const runs: Run[] = []
+    for (const blob of listed.blobs) {
+      const value = await store.get(blob.key, { type: "json", consistency: "strong" })
+      if (value && typeof value === "object") runs.push(value as Run)
+    }
+    return runs
+  } catch {
+    return []
+  }
+}
+
+const file = path.join(process.cwd(), "data", "runs.json")
+const seedFile = path.join(process.cwd(), "lib", "data", "seed-runs.json")
+
+type Database = { runs: Run[] }
+
+let queue: Promise<void> = Promise.resolve()
+
+function readDisk(): Database {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as Database
+    if (!parsed || !Array.isArray(parsed.runs)) return { runs: [] }
+    return parsed
+  } catch {
+    return { runs: [] }
+  }
+}
+
+function readSeed(): Run[] {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(seedFile, "utf8")) as Database
+    if (!parsed || !Array.isArray(parsed.runs)) return []
+    return parsed.runs.filter((run) => run?.id && run.id !== SAMPLE_RUN_ID)
+  } catch {
+    return []
+  }
+}
+
+function loadDatabase(): Database {
+  const disk = readDisk()
+  const seed = readSeed()
+  if (seed.length === 0) return disk
+  const have = new Set(disk.runs.map((run) => run.id))
+  const missing = seed.filter((run) => !have.has(run.id))
+  if (missing.length === 0) return disk
+  const merged: Database = { runs: [...disk.runs, ...missing] }
+  try {
+    write(merged)
+  } catch {
+    return merged
+  }
+  return merged
+}
+
+function write(db: Database) {
+  fs.mkdirSync(path.dirname(file), { recursive: true })
+  const tmp = `${file}.tmp`
+  fs.writeFileSync(tmp, JSON.stringify(db))
+  fs.renameSync(tmp, file)
+}
+
+export async function listRuns(): Promise<Run[]> {
+  const stored = (durable() ? await blobList() : loadDatabase().runs).filter((run) => run.id !== SAMPLE_RUN_ID)
+  stored.sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+  return [sampleRun(), ...stored]
+}
+
+export async function getRun(id: string): Promise<Run | null> {
+  if (id === SAMPLE_RUN_ID) return sampleRun()
+  if (durable()) return blobGet(id)
+  return loadDatabase().runs.find((run) => run.id === id) ?? null
+}
+
+export async function insertRun(run: Run): Promise<void> {
+  const job = queue.then(async () => {
+    if (durable()) {
+      await blobs().setJSON(`run:${run.id}`, run)
+      return
+    }
+    const db = loadDatabase()
+    db.runs = db.runs.filter((item) => item.id !== run.id)
+    db.runs.unshift(run)
+    write(db)
+  })
+  queue = job.then(
+    () => undefined,
+    () => undefined
+  )
+  await job
+}
+
+export async function updateRun<T>(
+  id: string,
+  fn: (run: Run) => T
+): Promise<T | null> {
+  if (id === SAMPLE_RUN_ID) return null
+  let result: T | null = null
+  let failed: unknown
+  const job = queue.then(async () => {
+    try {
+      const run = durable() ? await blobGet(id) : loadDatabase().runs.find((item) => item.id === id)
+      if (!run) return
+      result = fn(run)
+      run.updatedAt = new Date().toISOString()
+      if (durable()) await blobs().setJSON(`run:${id}`, run)
+      else {
+        const db = loadDatabase()
+        const index = db.runs.findIndex((item) => item.id === id)
+        if (index < 0) return
+        db.runs[index] = run
+        write(db)
+      }
+    } catch (error) {
+      failed = error
+    }
+  })
+  queue = job.then(
+    () => undefined,
+    () => undefined
+  )
+  await job
+  if (failed) throw failed
+  return result
+}
